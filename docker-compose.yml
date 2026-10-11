@@ -1,0 +1,172 @@
+# tenantfabric: a multi-team AI platform in one file.
+# agentgateway (one API key per team) in front of inference, MCP tools and memory.
+#
+#   docker compose up -d                                          # first start pulls ~3 GB of example models
+#   docker compose exec -T memsvc python - < tests/e2e.py         # end-to-end checks
+#   open http://localhost:8080/ui                                 # gateway UI
+#   docker compose down -v                                        # remove everything, including data
+#
+# Everything a team needs is in the `agentgateway` config below: keys, model aliases, tool rules.
+# The demo keys and passwords are placeholders. Change them before exposing this anywhere.
+
+name: tenantfabric
+
+services:
+  postgres:                      # pgvector: memory store/index + gateway request logs
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_PASSWORD: tenantfabric
+    configs:
+      - source: schema
+        target: /docker-entrypoint-initdb.d/01-schema.sql
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      retries: 30
+    restart: unless-stopped
+
+  ollama:                        # example model server (CPU). Swap for vLLM/TGI/a cloud API in the gateway config.
+    image: ollama/ollama:latest
+    volumes: [models:/root/.ollama]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      retries: 30
+    restart: unless-stopped
+
+  models:                        # one-shot: pull the example models into ollama
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c", "ollama pull nomic-embed-text && ollama pull qwen2.5:0.5b && ollama pull moondream"]
+    depends_on:
+      ollama: { condition: service_healthy }
+    restart: "no"
+
+  memsvc:                        # memory MCP service; reachable only through the gateway
+    image: ghcr.io/anindyar/memsvc:latest
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8041"
+      MEM_DB: postgresql://memsvc:memsvc@postgres:5432/postgres
+      MEM_GATEWAY: http://agentgateway:8080
+      MEM_GATEWAY_KEY: sk-memsvc-demo
+      MEM_MODES: alpha=md,beta=pg          # per-team storage mode: md = markdown + index, pg = pgvector only
+    volumes: [memory:/srv/memory]
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  agentgateway:                  # the only published port
+    image: ghcr.io/agentgateway/agentgateway:v1.5.0
+    command: ["-f", "/etc/agentgateway/config.yaml"]
+    configs:
+      - source: agentgateway
+        target: /etc/agentgateway/config.yaml
+    ports: ["${GATEWAY_PORT:-8080}:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      memsvc: { condition: service_started }
+    restart: unless-stopped
+
+volumes:
+  pgdata: {}
+  models: {}
+  memory: {}
+
+configs:
+  schema:
+    content: |
+      create extension if not exists vector;
+      create database agwlogs;               -- agentgateway request logs (UI Logs page)
+
+      -- One table for every memory, whatever the storage mode:
+      --   source = 'md'  index entry derived from a markdown file (path + line point back to it)
+      --   source = 'pg'  the row IS the memory (no file)
+      create table memory (
+        id        bigserial primary key,
+        tenant    text not null,
+        source    text not null,
+        path      text,
+        line      int,
+        content   text not null,
+        tags      text[] not null default '{}',
+        embedding vector(768) not null,      -- must match the embedding model (nomic-embed-text = 768)
+        created   timestamptz not null default now()
+      );
+      create index memory_hnsw on memory using hnsw (embedding vector_cosine_ops);
+      create index memory_tenant on memory (tenant, source, path);
+
+      -- memsvc connects as a non-owner role, so row-level security applies to it.
+      create role memsvc login password 'memsvc';
+      grant select, insert, update, delete on memory to memsvc;
+      grant usage on sequence memory_id_seq to memsvc;
+      alter table memory enable row level security;
+      create policy tenant_isolation on memory
+        using (tenant = current_setting('app.tenant', true))
+        with check (tenant = current_setting('app.tenant', true));
+
+  agentgateway:
+    content: |
+      config:
+        adminAddr: 127.0.0.1:15000
+        statsAddr: 0.0.0.0:15020
+        readinessAddr: 0.0.0.0:15021
+        database:
+          url: postgresql://postgres:tenantfabric@postgres:5432/agwlogs
+
+      gateways:
+        default:
+          port: 8080
+          protocol: HTTP
+
+      llm:
+        policies:
+          # One API key per team. The same keys scope MCP below (YAML anchor).
+          apiKey: &teamKeys
+            mode: strict
+            keys:
+            - key: sk-alpha-demo
+              metadata: { team: alpha }
+            - key: sk-beta-demo
+              metadata: { team: beta }
+            - key: sk-memsvc-demo          # memsvc's own key, used only for embeddings
+              metadata: { team: platform }
+
+        # Teams call stable aliases. Point each alias at any OpenAI-compatible backend;
+        # changing a backend is a one-line edit here, with no client changes.
+        models:
+        - name: chat-general              # example backend: qwen2.5:0.5b on ollama
+          provider: { custom: { formats: [ { type: completions } ] } }
+          params: { apiKey: dummy, model: "qwen2.5:0.5b", baseUrl: "http://ollama:11434" }
+          authorization:
+            rules: [ 'apiKey.team == "alpha"' ]
+        - name: chat-vision               # example backend: moondream (image + text) on ollama
+          provider: { custom: { formats: [ { type: completions } ] } }
+          params: { apiKey: dummy, model: moondream, baseUrl: "http://ollama:11434" }
+          authorization:
+            rules: [ 'apiKey.team == "beta"' ]
+        - name: embed                     # example backend: nomic-embed-text on ollama (768-dim)
+          provider: { custom: { formats: [ { type: embeddings } ] } }
+          params: { apiKey: dummy, model: nomic-embed-text, baseUrl: "http://ollama:11434" }
+          authorization:
+            rules: [ 'apiKey.team in ["alpha", "beta", "platform"]' ]
+
+      mcp:
+        targets:
+        - name: memory
+          mcp: { host: "http://memsvc:8041/mcp" }
+        policies:
+          apiKey: *teamKeys
+          # Stamp the caller's team on every memory call (overrides anything the client sent).
+          transformations:
+            request:
+              set:
+                x-team: 'apiKey.team'
+          mcpAuthorization:
+            rules:
+            - 'apiKey.team == "alpha"'                                                                   # alpha: all memory tools
+            - 'apiKey.team == "beta" && mcp.tool.name in ["memory_search", "memory_get", "memory_write"]' # beta: no forget/reindex
+
+      ui: {}
