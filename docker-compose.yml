@@ -58,6 +58,48 @@ services:
       postgres: { condition: service_healthy }
     restart: unless-stopped
 
+  tools:                         # example shared MCP tool server (utc_now, calculate, http_get); gateway-only
+    image: ghcr.io/anindyar/tenantfabric-toolbox:latest
+    command: ["python", "/app/tools.py"]
+    networks: [tools]              # shared only with the gateway
+    read_only: true                # commands run here: read-only root, no capabilities
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  # Per-team CLI runners. One container per team, holding only that team's credentials.
+  # Each sits on its own network shared only with the gateway, so nothing else can reach it.
+  # Put real credentials in a .env file next to this one (never commit it), e.g. ALPHA_AWS_ACCESS_KEY_ID=...
+  cli-alpha:
+    image: ghcr.io/anindyar/tenantfabric-toolbox:latest
+    command: ["python", "/app/runner.py"]
+    read_only: true                # commands run here: read-only root, no capabilities
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      RUNNER_TEAM: alpha
+      RUNNER_COMMANDS: curl,aws,jq
+      AWS_ACCESS_KEY_ID: ${ALPHA_AWS_ACCESS_KEY_ID:-AKIAALPHADEMOEXAMPLE}
+      AWS_SECRET_ACCESS_KEY: ${ALPHA_AWS_SECRET_ACCESS_KEY:-alpha-demo-secret-not-real}
+      AWS_DEFAULT_REGION: ${ALPHA_AWS_DEFAULT_REGION:-us-east-1}
+    networks: [cli-alpha]
+    restart: unless-stopped
+
+  cli-beta:                      # beta: no AWS credentials, and only curl + jq
+    image: ghcr.io/anindyar/tenantfabric-toolbox:latest
+    command: ["python", "/app/runner.py"]
+    read_only: true                # commands run here: read-only root, no capabilities
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      RUNNER_TEAM: beta
+      RUNNER_COMMANDS: curl,jq
+    networks: [cli-beta]
+    restart: unless-stopped
+
   agentgateway:                  # the only published port
     image: ghcr.io/agentgateway/agentgateway:v1.5.0
     command: ["-f", "/etc/agentgateway/config.yaml"]
@@ -65,10 +107,20 @@ services:
       - source: agentgateway
         target: /etc/agentgateway/config.yaml
     ports: ["${GATEWAY_PORT:-8080}:8080"]
+    networks: [default, tools, cli-alpha, cli-beta]
     depends_on:
       postgres: { condition: service_healthy }
       memsvc: { condition: service_started }
+      tools: { condition: service_started }
+      cli-alpha: { condition: service_started }
+      cli-beta: { condition: service_started }
     restart: unless-stopped
+
+networks:
+  default: {}
+  tools: {}                      # gateway + shared tool server only
+  cli-alpha: {}                  # gateway + alpha's runner only
+  cli-beta: {}                   # gateway + beta's runner only
 
 volumes:
   pgdata: {}
@@ -153,10 +205,15 @@ configs:
           authorization:
             rules: [ 'apiKey.team in ["alpha", "beta", "platform"]' ]
 
+      # /mcp: one MCP endpoint for every team. Each target is an MCP server; tools keep their own
+      # names (prefixMode: never), so names must be unique across targets.
       mcp:
+        prefixMode: never
         targets:
         - name: memory
           mcp: { host: "http://memsvc:8041/mcp" }
+        - name: tools                     # example shared tools; register any streamable-HTTP MCP server the same way
+          mcp: { host: "http://tools:8050/mcp" }
         policies:
           apiKey: *teamKeys
           # Stamp the caller's team on every memory call (overrides anything the client sent).
@@ -166,7 +223,36 @@ configs:
                 x-team: 'apiKey.team'
           mcpAuthorization:
             rules:
-            - 'apiKey.team == "alpha"'                                                                   # alpha: all memory tools
-            - 'apiKey.team == "beta" && mcp.tool.name in ["memory_search", "memory_get", "memory_write"]' # beta: no forget/reindex
+            # alpha: every tool on /mcp
+            - 'apiKey.team == "alpha"'
+            # beta: memory without forget/reindex, and the offline tools only (no http_get)
+            - 'apiKey.team == "beta" && mcp.tool.target == "memory" && mcp.tool.name in ["memory_search", "memory_get", "memory_write"]'
+            - 'apiKey.team == "beta" && mcp.tool.target == "tools" && mcp.tool.name in ["utc_now", "calculate"]'
+
+      # /cli/<team>: each team's own CLI runner (an MCP server with run_command + runner_info).
+      # Only that team's key gets through, and the runner also checks the X-Team the gateway sets.
+      routes:
+      - name: cli-alpha
+        matches: [ { path: { exact: /cli/alpha } } ]
+        policies:
+          apiKey: *teamKeys
+          authorization: { rules: [ { require: 'apiKey.team == "alpha"' } ] }
+          transformations: { request: { set: { x-team: 'apiKey.team' } } }
+        backends:
+        - mcp:
+            targets:
+            - name: cli
+              mcp: { host: "http://cli-alpha:8060/mcp" }
+      - name: cli-beta
+        matches: [ { path: { exact: /cli/beta } } ]
+        policies:
+          apiKey: *teamKeys
+          authorization: { rules: [ { require: 'apiKey.team == "beta"' } ] }
+          transformations: { request: { set: { x-team: 'apiKey.team' } } }
+        backends:
+        - mcp:
+            targets:
+            - name: cli
+              mcp: { host: "http://cli-beta:8060/mcp" }
 
       ui: {}

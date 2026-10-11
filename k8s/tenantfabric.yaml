@@ -234,6 +234,162 @@ spec:
       - name: memory
         persistentVolumeClaim: { claimName: memory }
 ---
+# Example shared MCP tool server (utc_now, calculate, http_get). The gateway decides which team may call which tool.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tools
+  namespace: tenantfabric
+  labels: { app.kubernetes.io/name: tools, app.kubernetes.io/component: mcp-tools, app.kubernetes.io/part-of: tenantfabric }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: tools }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: tools, app.kubernetes.io/component: mcp-tools, app.kubernetes.io/part-of: tenantfabric }
+    spec:
+      automountServiceAccountToken: false   # commands run here; give them no Kubernetes credentials
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      containers:
+      - name: tools
+        image: ghcr.io/anindyar/tenantfabric-toolbox:latest
+        args: ["python", "/app/tools.py"]
+        env:
+        - { name: HOST, value: "0.0.0.0" }
+        - { name: PORT, value: "8050" }
+        ports: [{ containerPort: 8050 }]
+        readinessProbe:
+          tcpSocket: { port: 8050 }
+          periodSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: { drop: [ALL] }
+        volumeMounts:
+        - { name: tmp, mountPath: /tmp }
+      volumes:
+      - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tools
+  namespace: tenantfabric
+spec:
+  selector: { app.kubernetes.io/name: tools }
+  ports: [{ name: http, port: 8050 }]
+---
+# Per-team CLI runners: one Deployment per team, holding only that team's credentials.
+# Replace the demo values in cli-alpha-aws with the team's real (least-privilege) credentials,
+# or project them from your secret manager with an ExternalSecret.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cli-alpha-aws
+  namespace: tenantfabric
+stringData:
+  AWS_ACCESS_KEY_ID: AKIAALPHADEMOEXAMPLE
+  AWS_SECRET_ACCESS_KEY: alpha-demo-secret-not-real
+  AWS_DEFAULT_REGION: us-east-1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cli-alpha
+  namespace: tenantfabric
+  labels: { app.kubernetes.io/name: cli-alpha, app.kubernetes.io/component: cli-runner, app.kubernetes.io/part-of: tenantfabric }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: cli-alpha }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: cli-alpha, app.kubernetes.io/component: cli-runner, app.kubernetes.io/part-of: tenantfabric }
+    spec:
+      automountServiceAccountToken: false   # commands run here; give them no Kubernetes credentials
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      containers:
+      - name: cli-alpha
+        image: ghcr.io/anindyar/tenantfabric-toolbox:latest
+        args: ["python", "/app/runner.py"]
+        env:
+        - { name: HOST, value: "0.0.0.0" }
+        - { name: PORT, value: "8060" }
+        - { name: RUNNER_TEAM, value: alpha }
+        - { name: RUNNER_COMMANDS, value: "curl,aws,jq" }
+        envFrom:
+        - secretRef: { name: cli-alpha-aws }    # alpha's credentials, and only alpha's
+        ports: [{ containerPort: 8060 }]
+        readinessProbe:
+          tcpSocket: { port: 8060 }
+          periodSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: { drop: [ALL] }
+        volumeMounts:
+        - { name: tmp, mountPath: /tmp }
+      volumes:
+      - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cli-alpha
+  namespace: tenantfabric
+spec:
+  selector: { app.kubernetes.io/name: cli-alpha }
+  ports: [{ name: http, port: 8060 }]
+---
+# beta: no AWS credentials, and only curl + jq.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cli-beta
+  namespace: tenantfabric
+  labels: { app.kubernetes.io/name: cli-beta, app.kubernetes.io/component: cli-runner, app.kubernetes.io/part-of: tenantfabric }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: cli-beta }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: cli-beta, app.kubernetes.io/component: cli-runner, app.kubernetes.io/part-of: tenantfabric }
+    spec:
+      automountServiceAccountToken: false   # commands run here; give them no Kubernetes credentials
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      containers:
+      - name: cli-beta
+        image: ghcr.io/anindyar/tenantfabric-toolbox:latest
+        args: ["python", "/app/runner.py"]
+        env:
+        - { name: HOST, value: "0.0.0.0" }
+        - { name: PORT, value: "8060" }
+        - { name: RUNNER_TEAM, value: beta }
+        - { name: RUNNER_COMMANDS, value: "curl,jq" }
+        ports: [{ containerPort: 8060 }]
+        readinessProbe:
+          tcpSocket: { port: 8060 }
+          periodSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: { drop: [ALL] }
+        volumeMounts:
+        - { name: tmp, mountPath: /tmp }
+      volumes:
+      - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cli-beta
+  namespace: tenantfabric
+spec:
+  selector: { app.kubernetes.io/name: cli-beta }
+  ports: [{ name: http, port: 8060 }]
+---
 # The gateway: keys, model aliases, per-model and per-tool rules, X-Team stamping.
 apiVersion: v1
 kind: Secret
@@ -286,10 +442,15 @@ stringData:
         authorization:
           rules: [ 'apiKey.team in ["alpha", "beta", "platform"]' ]
 
+    # /mcp: one MCP endpoint for every team. Each target is an MCP server; tools keep their own
+    # names (prefixMode: never), so names must be unique across targets.
     mcp:
+      prefixMode: never
       targets:
       - name: memory
         mcp: { host: "http://memsvc:8041/mcp" }
+      - name: tools                     # example shared tools; register any streamable-HTTP MCP server the same way
+        mcp: { host: "http://tools:8050/mcp" }
       policies:
         apiKey: *teamKeys
         # Stamp the caller's team on every memory call (overrides anything the client sent).
@@ -299,8 +460,37 @@ stringData:
               x-team: 'apiKey.team'
         mcpAuthorization:
           rules:
-          - 'apiKey.team == "alpha"'                                                                   # alpha: all memory tools
-          - 'apiKey.team == "beta" && mcp.tool.name in ["memory_search", "memory_get", "memory_write"]' # beta: no forget/reindex
+          # alpha: every tool on /mcp
+          - 'apiKey.team == "alpha"'
+          # beta: memory without forget/reindex, and the offline tools only (no http_get)
+          - 'apiKey.team == "beta" && mcp.tool.target == "memory" && mcp.tool.name in ["memory_search", "memory_get", "memory_write"]'
+          - 'apiKey.team == "beta" && mcp.tool.target == "tools" && mcp.tool.name in ["utc_now", "calculate"]'
+
+    # /cli/<team>: each team's own CLI runner (an MCP server with run_command + runner_info).
+    # Only that team's key gets through, and the runner also checks the X-Team the gateway sets.
+    routes:
+    - name: cli-alpha
+      matches: [ { path: { exact: /cli/alpha } } ]
+      policies:
+        apiKey: *teamKeys
+        authorization: { rules: [ { require: 'apiKey.team == "alpha"' } ] }
+        transformations: { request: { set: { x-team: 'apiKey.team' } } }
+      backends:
+      - mcp:
+          targets:
+          - name: cli
+            mcp: { host: "http://cli-alpha:8060/mcp" }
+    - name: cli-beta
+      matches: [ { path: { exact: /cli/beta } } ]
+      policies:
+        apiKey: *teamKeys
+        authorization: { rules: [ { require: 'apiKey.team == "beta"' } ] }
+        transformations: { request: { set: { x-team: 'apiKey.team' } } }
+      backends:
+      - mcp:
+          targets:
+          - name: cli
+            mcp: { host: "http://cli-beta:8060/mcp" }
 
     ui: {}
 ---
@@ -381,3 +571,32 @@ spec:
     - podSelector: { matchLabels: { app.kubernetes.io/name: agentgateway } }
     - podSelector: { matchLabels: { app.kubernetes.io/name: models } }
     ports: [{ port: 11434 }]
+---
+# Only the gateway may reach the tool server and the CLI runners (runners trust the X-Team header).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tools-from-gateway-only
+  namespace: tenantfabric
+spec:
+  podSelector:
+    matchExpressions: [{ key: app.kubernetes.io/component, operator: In, values: [mcp-tools, cli-runner] }]
+  policyTypes: [Ingress]
+  ingress:
+  - from: [{ podSelector: { matchLabels: { app.kubernetes.io/name: agentgateway } } }]
+---
+# Tools and runners may call out (APIs, AWS), but never the cloud metadata service: on a cloud node
+# that would hand any team the node's own instance credentials. Tighten further per team if needed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tools-egress-no-metadata
+  namespace: tenantfabric
+spec:
+  podSelector:
+    matchExpressions: [{ key: app.kubernetes.io/component, operator: In, values: [mcp-tools, cli-runner] }]
+  policyTypes: [Egress]
+  egress:
+  - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } } }]
+    ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+  - to: [{ ipBlock: { cidr: 0.0.0.0/0, except: [169.254.0.0/16] } }]

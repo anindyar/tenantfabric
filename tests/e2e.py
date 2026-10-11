@@ -47,11 +47,11 @@ def chat(key, model):
                 {"model": model, "max_tokens": 20, "messages": [{"role": "user", "content": "Reply with the word ok"}]})
 
 
-def mcp(key, cmd, tool=None, args=None, extra_headers=None):
+def mcp(key, cmd, tool=None, args=None, extra_headers=None, path="/mcp"):
     """list | call. Returns text; gateway rejections come back as 'DENIED ...'."""
     async def run():
-        headers = {"Authorization": f"Bearer {key}", **(extra_headers or {})}
-        async with streamablehttp_client(GW + "/mcp", headers=headers) as (r, w, _):
+        headers = {"Authorization": f"Bearer {key}", **(extra_headers or {})} if key else dict(extra_headers or {})
+        async with streamablehttp_client(GW + path, headers=headers) as (r, w, _):
             async with ClientSession(r, w) as s:
                 await s.initialize()
                 if cmd == "list":
@@ -65,6 +65,18 @@ def mcp(key, cmd, tool=None, args=None, extra_headers=None):
             e = e.exceptions[0]
         resp = getattr(e, "response", None)
         return f"DENIED by gateway: HTTP {resp.status_code}" if resp is not None else f"ERROR: {e!r}"
+
+
+def cli(key, team, tool, args=None, extra_headers=None):
+    return mcp(key, "call", tool, args, extra_headers, path=f"/cli/{team}")
+
+
+def reachable(url):
+    try:
+        httpx.get(url, timeout=3)
+        return "reachable"
+    except httpx.HTTPError as e:
+        return f"unreachable ({type(e).__name__})"
 
 
 def sql(tenant, q):
@@ -143,6 +155,43 @@ mem_id = int(m.group(1)) if m else 0
 check("memory_forget removes the line", "removed alpha/MEMORY.md", mcp(ALPHA, "call", "memory_forget", {"id": mem_id}))
 absent("line is gone from the markdown file", "staging cluster", read(alpha_md))
 absent("and from the index", "staging cluster", sql("alpha", "select content from memory"))
+
+print("== 8. Shared MCP tools (one endpoint, per-team per-tool rules)")
+alpha_tools, beta_tools = mcp(ALPHA, "list"), mcp(BETA, "list")
+check("alpha sees http_get next to memory tools", "http_get", alpha_tools)
+check("tool names stay unprefixed (memory_search)", "\nmemory_search", "\n" + alpha_tools)
+check("beta sees calculate", "calculate", beta_tools)
+absent("beta does not see http_get", "http_get", beta_tools)
+check("alpha calls calculate", "12.75", mcp(ALPHA, "call", "calculate", {"expression": "(17 * 3) / 4"}))
+result(bool(re.match(r"\d{4}-\d\d-\d\dT", mcp(BETA, "call", "utc_now", {}))), "beta calls utc_now")
+check("beta call http_get refused by the gateway", "DENIED by gateway: HTTP 400", mcp(BETA, "call", "http_get", {"url": "http://example.com"}))
+check("calculate refuses huge results", "too large", mcp(ALPHA, "call", "calculate", {"expression": "((9**99)**99)**99"}))
+
+print("== 9. Per-team CLI runners (/cli/<team>)")
+check("no key -> 401", "HTTP 401", cli(None, "alpha", "runner_info"))
+check("beta key on alpha's runner -> 403", "HTTP 403", cli(BETA, "alpha", "runner_info"))
+check("alpha key on beta's runner -> 403", "HTTP 403", cli(ALPHA, "beta", "runner_info"))
+info = cli(ALPHA, "alpha", "runner_info")
+check("alpha reaches its runner", "team: alpha", info)
+check("alpha's runner holds alpha's AWS credentials", "AWS_ACCESS_KEY_ID", info)
+awsconf = cli(ALPHA, "alpha", "run_command", {"command": "aws configure list"})
+result(bool(re.search(r"access_key\W+\S+\W+env", awsconf)), "aws CLI runs with them (keys from env)", awsconf)
+check("jq runs with data on stdin", "exit 0\n--- stdout\nalpha",
+      cli(ALPHA, "alpha", "run_command", {"command": "jq -r .team", "stdin": '{"team": "alpha"}'}))
+check("programs outside the allowlist are refused", "not allowed: bash",
+      cli(ALPHA, "alpha", "run_command", {"command": "bash -c id"}))
+check("no shell: $VARS are not expanded", "$AWS_SECRET_ACCESS_KEY",
+      cli(ALPHA, "alpha", "run_command", {"command": "jq -n --arg v $AWS_SECRET_ACCESS_KEY $v"}))
+absent("aws config is read-only (no credential_process/alias planting)", "exit 0",
+       cli(ALPHA, "alpha", "run_command", {"command": "aws configure set profile.x.credential_process id"}))
+check("curl config/engine options are refused", "option not allowed",
+      cli(ALPHA, "alpha", "run_command", {"command": "curl -sK /tmp/x http://example.com"}))
+binfo = cli(BETA, "beta", "runner_info")
+check("beta's runner has no credentials", "credential variables: none", binfo)
+check("beta's runner allows only curl, jq", "programs: curl, jq", binfo)
+check("beta cannot run aws", "not allowed: aws", cli(BETA, "beta", "run_command", {"command": "aws sts get-caller-identity"}))
+check("beta spoofing X-Team: alpha stays beta", "team: beta", cli(BETA, "beta", "runner_info", None, {"x-team": "alpha"}))
+check("runners are unreachable except through the gateway", "unreachable", reachable("http://cli-alpha:8060/mcp"))
 
 print(f"\nRESULT: {passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
