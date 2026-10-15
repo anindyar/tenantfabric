@@ -1,0 +1,489 @@
+openapi: 3.1.0
+info:
+  title: tenantfabric gateway
+  version: "1.0.0"
+  summary: One API key per team for inference, tool calling, MCP tools and memory.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  description: |
+    tenantfabric puts **agentgateway** in front of everything a team's AI application uses:
+
+    * **Inference**: OpenAI-compatible `/v1/chat/completions`, `/v1/embeddings` and `/v1/models`.
+      Teams call model *aliases*; the gateway maps each alias to a backend.
+    * **Tool calling**: OpenAI function calling. Models return `tool_calls`; your agent executes them.
+    * **MCP tools and memory**: one Model Context Protocol endpoint, `/mcp`, merging the memory
+      server (memsvc) and the shared tool server. Memory is isolated per team by the gateway.
+    * **CLI runners**: `/cli/<team>`, each team's own runner holding only that team's credentials.
+
+    ## Authentication
+    Every endpoint takes the same team key: `Authorization: Bearer <key>`.
+    The key's **team** decides which models, MCP tools and routes it can use.
+    Missing or unknown key → `401`. Known key without access → `403` (models and routes), or the tool is
+    hidden from `tools/list` and refused on `tools/call` (MCP).
+
+    | Team | Models | MCP tools on `/mcp` | Runner |
+    |---|---|---|---|
+    | `alpha` | `chat-general`, `embed` | all memory tools, `utc_now`, `calculate`, `http_get` | `/cli/alpha`: curl, aws, jq + alpha's AWS credentials |
+    | `beta` | `chat-vision`, `embed` | `memory_write`, `memory_search`, `memory_get`, `utc_now`, `calculate` | `/cli/beta`: curl, jq, no credentials |
+
+    ## Policy checks (OPA)
+    Every call also passes a policy service that checks what the request asks for. A refused call gets `403`
+    with `{"error": {"type": "policy_denied", "message": "..."}}`:
+
+    * `memory_reindex`, and `run_command` with a destructive command (rm, delete, terminate, destroy, drop,
+      truncate, put-bucket-policy), need the header **`x-approved: true`**: send it only after a person approved.
+    * `http_get` fetches only `https://` URLs on public hosts (no IP addresses, single-label or internal names).
+    * `memory_write` refuses text that contains an API key, access key or private key.
+    * The optional header **`x-data-class`** must be `public`, `internal`, `confidential` (default) or `restricted`.
+
+    ## Tool-output guardrails
+    Tool results sent back to a model are checked: prompt-injection phrases are rejected with `403`;
+    emails, phone numbers, card numbers and secret-looking strings are masked.
+
+    ## Using MCP over HTTP (streamable HTTP transport)
+    1. `POST /mcp` with `initialize`. Read the **`Mcp-Session-Id`** response header.
+    2. `POST /mcp` with `notifications/initialized` (expect `202`), sending `Mcp-Session-Id`.
+    3. `tools/list`, then `tools/call`, always sending `Mcp-Session-Id`.
+    4. `DELETE /mcp` with `Mcp-Session-Id` to end the session.
+
+    Always send `Accept: application/json, text/event-stream`. Responses may come back as
+    `text/event-stream`; the JSON-RPC message is in the last `data:` line. MCP clients do all of this for you:
+    `claude mcp add --transport http team http://localhost:8080/mcp --header "Authorization: Bearer <key>"`
+servers:
+  - url: http://localhost:8080
+    description: tenantfabric gateway (Docker Compose default; on Kubernetes, port-forward svc/agentgateway)
+security:
+  - teamKey: []
+tags:
+  - name: Inference
+    description: OpenAI-compatible model endpoints.
+  - name: MCP
+    description: The merged MCP endpoint (memory + shared tools).
+  - name: CLI runners
+    description: Each team's own runner.
+paths:
+  /v1/models:
+    get:
+      tags: [Inference]
+      summary: List the models your key may use
+      operationId: listModels
+      responses:
+        "200":
+          description: Models visible to this key.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ModelList" }
+              example:
+                object: list
+                data:
+                  - { id: chat-general, object: model, created: 1791990000, owned_by: agentgateway }
+                  - { id: embed, object: model, created: 1791990000, owned_by: agentgateway }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/chat/completions:
+    post:
+      tags: [Inference]
+      summary: Chat completion, streaming and tool calling
+      description: |
+        OpenAI Chat Completions format for every backend. Set `stream: true` for server-sent events,
+        terminated by `data: [DONE]`.
+
+        **Tool calling** is two requests: (1) send `tools`; the model answers with `message.tool_calls`.
+        (2) Run the tool yourself (for MCP tools, via `/mcp` `tools/call`), then send the history back with an
+        `assistant` message holding the `tool_calls` and a `tool` message holding the result.
+      operationId: createChatCompletion
+      parameters:
+        - $ref: "#/components/parameters/DataClass"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChatRequest" }
+            examples:
+              simple:
+                summary: Plain chat (alpha)
+                value:
+                  model: chat-general
+                  max_tokens: 64
+                  messages:
+                    - { role: user, content: "In one sentence, what is an API gateway?" }
+              streaming:
+                summary: Streaming (SSE)
+                value:
+                  model: chat-general
+                  stream: true
+                  messages:
+                    - { role: user, content: "Count from 1 to 5." }
+              toolCallStep1:
+                summary: "Tool calling, step 1: model requests a tool"
+                value:
+                  model: chat-general
+                  temperature: 0
+                  tool_choice: auto
+                  tools:
+                    - type: function
+                      function:
+                        name: calculate
+                        description: Evaluate an arithmetic expression
+                        parameters:
+                          type: object
+                          properties: { expression: { type: string } }
+                          required: [expression]
+                  messages:
+                    - { role: user, content: "What is 17 * 23? Use the tool." }
+              toolCallStep2:
+                summary: "Tool calling, step 2: return the tool result"
+                value:
+                  model: chat-general
+                  temperature: 0
+                  messages:
+                    - { role: user, content: "What is 17 * 23? Use the tool." }
+                    - role: assistant
+                      content: null
+                      tool_calls:
+                        - id: call_1
+                          type: function
+                          function: { name: calculate, arguments: '{"expression":"17*23"}' }
+                    - { role: tool, tool_call_id: call_1, content: "391" }
+      responses:
+        "200":
+          description: Completion (JSON), or an SSE stream when `stream` is true.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatResponse" }
+            text/event-stream:
+              schema:
+                type: string
+                description: "`data: {chunk}` lines, ending with `data: [DONE]`."
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: The team may not use this model, a guardrail rejected a tool result, or the policy refused the call.
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /v1/embeddings:
+    post:
+      tags: [Inference]
+      summary: Create embeddings
+      operationId: createEmbeddings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, input]
+              properties:
+                model: { type: string, enum: [embed], description: "nomic-embed-text, 768 dimensions" }
+                input:
+                  oneOf:
+                    - type: string
+                    - type: array
+                      items: { type: string }
+            example: { model: embed, input: [first text, second text] }
+      responses:
+        "200":
+          description: Embedding vectors.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        index: { type: integer }
+                        embedding: { type: array, items: { type: number } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /mcp:
+    post:
+      tags: [MCP]
+      summary: MCP JSON-RPC (initialize, tools/list, tools/call, ...)
+      description: |
+        | Target | Tools |
+        |---|---|
+        | `memory` | `memory_write(text, tags?, file?)`, `memory_search(query, k?)`, `memory_get(id?, file?)`, `memory_forget(id)`, `memory_reindex()` |
+        | `tools` | `utc_now()`, `calculate(expression)`, `http_get(url)` |
+
+        You see only the tools your team may use. Memory is stored per team: the gateway sets the team from
+        your key, so one team can never read another team's memory, whatever the client sends.
+      operationId: mcpRequest
+      parameters:
+        - $ref: "#/components/parameters/McpSessionId"
+        - $ref: "#/components/parameters/McpAccept"
+        - $ref: "#/components/parameters/Approved"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/JsonRpcRequest" }
+            examples:
+              initialize: { $ref: "#/components/examples/McpInitialize" }
+              initialized:
+                summary: notifications/initialized
+                value: { jsonrpc: "2.0", method: notifications/initialized }
+              toolsList: { $ref: "#/components/examples/McpToolsList" }
+              calculate:
+                summary: tools/call - calculate
+                value: { jsonrpc: "2.0", id: 10, method: tools/call, params: { name: calculate, arguments: { expression: "17*23" } } }
+              memoryWrite:
+                summary: tools/call - memory_write
+                value: { jsonrpc: "2.0", id: 21, method: tools/call, params: { name: memory_write, arguments: { text: "Deploys freeze on Fridays after 15:00", tags: [ops] } } }
+              memorySearch:
+                summary: tools/call - memory_search
+                value: { jsonrpc: "2.0", id: 22, method: tools/call, params: { name: memory_search, arguments: { query: "when do deploys freeze?", k: 3 } } }
+              memoryReindex:
+                summary: tools/call - memory_reindex (needs x-approved true)
+                value: { jsonrpc: "2.0", id: 23, method: tools/call, params: { name: memory_reindex, arguments: {} } }
+      responses:
+        "200": { $ref: "#/components/responses/McpResult" }
+        "202": { description: Notification accepted. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/PolicyDenied" }
+    delete:
+      tags: [MCP]
+      summary: End an MCP session
+      operationId: mcpEndSession
+      parameters:
+        - $ref: "#/components/parameters/McpSessionIdRequired"
+      responses:
+        "200": { description: Session closed. }
+        "204": { description: Session closed. }
+
+  /cli/{team}:
+    post:
+      tags: [CLI runners]
+      summary: Your team's CLI runner (MCP)
+      description: |
+        Tools: `runner_info()` and `run_command(command, stdin?)`. Commands run **without a shell** (no pipes,
+        redirects or `$VARS`); to chain, pass one command's output as the next one's `stdin`. Only your team's key
+        is accepted; any other key gets `403`.
+      operationId: cliRunner
+      parameters:
+        - name: team
+          in: path
+          required: true
+          schema: { type: string, enum: [alpha, beta] }
+        - $ref: "#/components/parameters/McpSessionId"
+        - $ref: "#/components/parameters/McpAccept"
+        - $ref: "#/components/parameters/Approved"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/JsonRpcRequest" }
+            examples:
+              initialize: { $ref: "#/components/examples/McpInitialize" }
+              runnerInfo:
+                summary: tools/call - runner_info
+                value: { jsonrpc: "2.0", id: 60, method: tools/call, params: { name: runner_info, arguments: {} } }
+              runCommand:
+                summary: tools/call - run_command
+                value: { jsonrpc: "2.0", id: 61, method: tools/call, params: { name: run_command, arguments: { command: "jq -r .team", stdin: '{"team":"alpha"}' } } }
+      responses:
+        "200": { $ref: "#/components/responses/McpResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+components:
+  securitySchemes:
+    teamKey:
+      type: http
+      scheme: bearer
+      description: Your team's API key. The same key works on every endpoint.
+
+  parameters:
+    McpSessionId:
+      name: Mcp-Session-Id
+      in: header
+      required: false
+      description: Session id returned by `initialize`. Required on every request after `initialize`.
+      schema: { type: string }
+    McpSessionIdRequired:
+      name: Mcp-Session-Id
+      in: header
+      required: true
+      schema: { type: string }
+    McpAccept:
+      name: Accept
+      in: header
+      required: true
+      schema: { type: string, default: "application/json, text/event-stream" }
+    Approved:
+      name: x-approved
+      in: header
+      required: false
+      description: Send `true` only after a person approved the action (memory_reindex, destructive run_command).
+      schema: { type: string, enum: ["true"] }
+    DataClass:
+      name: x-data-class
+      in: header
+      required: false
+      schema: { type: string, enum: [public, internal, confidential, restricted], default: confidential }
+
+  examples:
+    McpInitialize:
+      summary: initialize
+      value: { jsonrpc: "2.0", id: 1, method: initialize, params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: my-agent, version: "1.0" } } }
+    McpToolsList:
+      summary: tools/list
+      value: { jsonrpc: "2.0", id: 2, method: tools/list, params: {} }
+
+  responses:
+    Unauthorized:
+      description: Missing or unknown API key.
+      content:
+        text/plain:
+          schema: { type: string }
+          example: "api key authentication failure: no API Key found"
+    Forbidden:
+      description: The key is valid but its team may not use this model or route.
+      content:
+        text/plain:
+          schema: { type: string }
+    PolicyDenied:
+      description: Refused by the policy service.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  type: { type: string, const: policy_denied }
+                  message: { type: string }
+          example: { error: { type: policy_denied, message: "memory_reindex requires approval (header x-approved: true)" } }
+    McpResult:
+      description: JSON-RPC result, as JSON or as an event stream. `initialize` also returns the `Mcp-Session-Id` header.
+      headers:
+        Mcp-Session-Id:
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/JsonRpcResponse" }
+          example: { jsonrpc: "2.0", id: 10, result: { content: [ { type: text, text: "391" } ], isError: false } }
+        text/event-stream:
+          schema: { type: string }
+
+  schemas:
+    ModelList:
+      type: object
+      properties:
+        object: { type: string }
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              object: { type: string }
+              created: { type: integer }
+              owned_by: { type: string }
+    Message:
+      type: object
+      required: [role]
+      properties:
+        role: { type: string, enum: [system, user, assistant, tool] }
+        content:
+          oneOf:
+            - type: string
+            - type: "null"
+            - type: array
+              items: { type: object }
+        tool_calls:
+          type: array
+          items: { $ref: "#/components/schemas/ToolCall" }
+        tool_call_id: { type: string }
+    Tool:
+      type: object
+      required: [type, function]
+      properties:
+        type: { type: string, const: function }
+        function:
+          type: object
+          required: [name]
+          properties:
+            name: { type: string }
+            description: { type: string }
+            parameters: { type: object }
+    ToolCall:
+      type: object
+      properties:
+        id: { type: string }
+        type: { type: string, const: function }
+        function:
+          type: object
+          properties:
+            name: { type: string }
+            arguments: { type: string, description: JSON-encoded arguments. }
+    ChatRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model: { type: string, enum: [chat-general, chat-vision] }
+        messages:
+          type: array
+          items: { $ref: "#/components/schemas/Message" }
+        tools:
+          type: array
+          items: { $ref: "#/components/schemas/Tool" }
+        tool_choice:
+          oneOf:
+            - type: string
+              enum: [auto, none, required]
+            - type: object
+        temperature: { type: number }
+        max_tokens: { type: integer }
+        stream: { type: boolean, default: false }
+    ChatResponse:
+      type: object
+      properties:
+        id: { type: string }
+        model: { type: string }
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index: { type: integer }
+              finish_reason: { type: string }
+              message: { $ref: "#/components/schemas/Message" }
+        usage:
+          type: object
+          properties:
+            prompt_tokens: { type: integer }
+            completion_tokens: { type: integer }
+            total_tokens: { type: integer }
+    JsonRpcRequest:
+      type: object
+      required: [jsonrpc, method]
+      properties:
+        jsonrpc: { type: string, const: "2.0" }
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+        method: { type: string }
+        params: { type: object }
+    JsonRpcResponse:
+      type: object
+      properties:
+        jsonrpc: { type: string }
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+        result: { type: object }
+        error:
+          type: object
+          properties:
+            code: { type: integer }
+            message: { type: string }

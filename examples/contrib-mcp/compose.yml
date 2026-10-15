@@ -1,0 +1,16 @@
+# EXAMPLE: running a team's own MCP server next to tenantfabric with Docker Compose.
+#   docker compose -f docker-compose.yml -f examples/contrib-mcp/compose.yml up -d
+# Then register it in the gateway config (CLAUDE.md, "Register a team's own MCP server") and recreate the gateway.
+services:
+  invoices-mcp:
+    image: registry.example.com/invoices-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    environment:
+      PORT: "8070"
+      ERP_API_URL: https://erp.example.com/api
+      ERP_API_TOKEN: ${INVOICES_ERP_API_TOKEN:?set it in .env}
+    networks: [tools]              # the network shared only with the gateway; never publish its port
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped

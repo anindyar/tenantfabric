@@ -4,10 +4,12 @@
 #   docker compose up -d                                          # first start pulls ~3 GB of example models
 #   docker compose exec -T memsvc python - < tests/e2e.py         # end-to-end checks
 #   open http://localhost:8080/ui                                 # gateway UI
+#   open http://localhost:8080/docs/                              # API reference (Swagger UI)
 #   docker compose down -v                                        # remove everything, including data
 #
 # Everything a team needs is in the `agentgateway` config below: keys, model aliases, tool rules.
-# The demo keys and passwords are placeholders. Change them before exposing this anywhere.
+# The demo keys and passwords are placeholders. Put real values in a .env file next to this one
+# (see .env.example: TF_KEY_ALPHA, TF_POSTGRES_PASSWORD, ...) before exposing this anywhere.
 
 name: tenantfabric
 
@@ -15,7 +17,7 @@ services:
   postgres:                      # pgvector: memory store/index + gateway request logs
     image: pgvector/pgvector:pg17
     environment:
-      POSTGRES_PASSWORD: tenantfabric
+      POSTGRES_PASSWORD: ${TF_POSTGRES_PASSWORD:-tenantfabric}
     configs:
       - source: schema
         target: /docker-entrypoint-initdb.d/01-schema.sql
@@ -49,9 +51,9 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: "8041"
-      MEM_DB: postgresql://memsvc:memsvc@postgres:5432/postgres
+      MEM_DB: postgresql://memsvc:${TF_MEMSVC_DB_PASSWORD:-memsvc}@postgres:5432/postgres
       MEM_GATEWAY: http://agentgateway:8080
-      MEM_GATEWAY_KEY: sk-memsvc-demo
+      MEM_GATEWAY_KEY: ${TF_KEY_MEMSVC:-sk-memsvc-demo}
       MEM_MODES: alpha=md,beta=pg          # per-team storage mode: md = markdown + index, pg = pgvector only
     volumes: [memory:/srv/memory]
     depends_on:
@@ -100,6 +102,32 @@ services:
     networks: [cli-beta]
     restart: unless-stopped
 
+  opa:                           # policy checks on every /v1, /mcp and /cli call (policy/policy.rego); gateway-only
+    image: openpolicyagent/opa:0.70.0-envoy-1
+    command: ["run", "--server", "--addr=:8181", "--config-file=/policy/config.yaml", "/policy/policy.rego"]
+    configs:
+      - { source: opa-config, target: /policy/config.yaml }
+      - { source: opa-policy, target: /policy/policy.rego }
+    networks: [policy]             # shared only with the gateway
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  docs:                          # API reference at /docs (Swagger UI + docs/openapi.yaml), served through the gateway
+    image: swaggerapi/swagger-ui:v5.17.14
+    environment:
+      BASE_URL: /docs
+      URL: /docs/openapi.yaml
+      PORT: "8080"
+      DOC_EXPANSION: list
+      DEEP_LINKING: "true"
+      TRY_IT_OUT_ENABLED: "true"
+    configs:
+      - { source: openapi, target: /usr/share/nginx/html/openapi.yaml }
+    networks: [docs]
+    restart: unless-stopped
+
   agentgateway:                  # the only published port
     image: ghcr.io/agentgateway/agentgateway:v1.5.0
     command: ["-f", "/etc/agentgateway/config.yaml"]
@@ -107,9 +135,11 @@ services:
       - source: agentgateway
         target: /etc/agentgateway/config.yaml
     ports: ["${GATEWAY_PORT:-8080}:8080"]
-    networks: [default, tools, cli-alpha, cli-beta]
+    networks: [default, tools, cli-alpha, cli-beta, policy, docs]
     depends_on:
       postgres: { condition: service_healthy }
+      opa: { condition: service_started }
+      docs: { condition: service_started }
       memsvc: { condition: service_started }
       tools: { condition: service_started }
       cli-alpha: { condition: service_started }
@@ -121,6 +151,8 @@ networks:
   tools: {}                      # gateway + shared tool server only
   cli-alpha: {}                  # gateway + alpha's runner only
   cli-beta: {}                   # gateway + beta's runner only
+  policy: {}                     # gateway + OPA only
+  docs: {}                       # gateway + Swagger UI only
 
 volumes:
   pgdata: {}
@@ -128,6 +160,18 @@ volumes:
   memory: {}
 
 configs:
+  opa-policy:
+    file: ./policy/policy.rego
+  opa-config:
+    content: |
+      plugins:
+        envoy_ext_authz_grpc:
+          addr: :9191
+          path: tenantfabric/authz/result
+      decision_logs:
+        console: true
+  openapi:
+    file: ./docs/openapi.yaml
   schema:
     content: |
       create extension if not exists vector;
@@ -151,7 +195,7 @@ configs:
       create index memory_tenant on memory (tenant, source, path);
 
       -- memsvc connects as a non-owner role, so row-level security applies to it.
-      create role memsvc login password 'memsvc';
+      create role memsvc login password '${TF_MEMSVC_DB_PASSWORD:-memsvc}';
       grant select, insert, update, delete on memory to memsvc;
       grant usage on sequence memory_id_seq to memsvc;
       alter table memory enable row level security;
@@ -166,7 +210,18 @@ configs:
         statsAddr: 0.0.0.0:15020
         readinessAddr: 0.0.0.0:15021
         database:
-          url: postgresql://postgres:tenantfabric@postgres:5432/agwlogs
+          url: postgresql://postgres:${TF_POSTGRES_PASSWORD:-tenantfabric}@postgres:5432/agwlogs
+        # OPTIONAL: trace every request to an OTLP collector (Langfuse, Jaeger, Tempo), tagged with the caller's team.
+        # tracing:
+        #   otlpEndpoint: http://langfuse-web:3000
+        #   path: /api/public/otel/v1/traces
+        #   otlpProtocol: http
+        #   headers: { Authorization: '"Basic <base64 of public-key:secret-key>"' }
+        #   randomSampling: true
+        #   fields:
+        #     add:
+        #       langfuse.user.id: apiKey.team
+        #       langfuse.environment: '"demo"'
 
       gateways:
         default:
@@ -175,16 +230,49 @@ configs:
 
       llm:
         policies:
-          # One API key per team. The same keys scope MCP below (YAML anchor).
+          # One API key per team. The same keys scope /mcp and every route below (YAML anchor).
           apiKey: &teamKeys
             mode: strict
             keys:
-            - key: sk-alpha-demo
+            - key: ${TF_KEY_ALPHA:-sk-alpha-demo}
               metadata: { team: alpha }
-            - key: sk-beta-demo
+            - key: ${TF_KEY_BETA:-sk-beta-demo}
               metadata: { team: beta }
-            - key: sk-memsvc-demo          # memsvc's own key, used only for embeddings
+            - key: ${TF_KEY_MEMSVC:-sk-memsvc-demo}       # memsvc's own key, used only for embeddings
               metadata: { team: platform }
+          # Tool results sent back to a model: reject prompt injection, mask personal data and secrets.
+          guardrails:
+            request:
+            - regex:
+                action: reject
+                rules:
+                - pattern: (?i)ignore (all |any )?(the )?(previous|prior|above|earlier) (instructions|rules|prompts?)
+                - pattern: (?i)disregard (all |the )?(previous|prior|above|system) (instructions|prompt)
+                - pattern: (?i)you are now (in )?(developer|dan|jailbreak) mode
+                - pattern: '(?i)(new|updated) system (prompt|instructions)\s*:'
+                - pattern: (?i)(send|post|exfiltrate|upload) (the |all )?(api key|password|credentials|token|secrets?) to
+              scope: [toolOutput]
+              rejection:
+                status: 403
+                body: 'Blocked by guardrails: a tool result contained injected instructions.'
+            - regex:
+                action: mask
+                rules:
+                - builtin: email
+                - builtin: phoneNumber
+                - builtin: creditCard
+                - pattern: \b(?:sk|pk|rk)-[A-Za-z0-9_\-]{16,}\b      # API keys
+                - pattern: \bAKIA[0-9A-Z]{16}\b                    # AWS access key ids
+                # add national ID formats for your region here, e.g. India PAN: \b[A-Z]{5}\d{4}[A-Z]\b
+              scope: [toolOutput]
+          # Every model call is also checked by OPA (policy/policy.rego). failureMode deny: if OPA is down, calls fail.
+          extAuthz:
+            host: opa:9191
+            protocol:
+              grpc:
+                metadata:
+                  team: apiKey.team
+            failureMode: deny
 
         # Teams call stable aliases. Point each alias at any OpenAI-compatible backend;
         # changing a backend is a one-line edit here, with no client changes.
@@ -204,6 +292,22 @@ configs:
           params: { apiKey: dummy, model: nomic-embed-text, baseUrl: "http://ollama:11434" }
           authorization:
             rules: [ 'apiKey.team in ["alpha", "beta", "platform"]' ]
+        # OPTIONAL: a cloud model. The key is read from a mounted file, never written here.
+        # - name: chat-cloud
+        #   provider: openAI
+        #   params: { model: gpt-4o-mini, apiKey: { file: /secrets/openai-key } }
+        #   authorization:
+        #     rules: [ 'apiKey.team == "alpha"' ]
+
+        # OPTIONAL: one alias that fails over between backends. If the fallback is a cloud model, data can leave
+        # your network without the caller choosing it: say so to the teams that use it.
+        # virtualModels:
+        # - name: chat-auto
+        #   routing:
+        #     failover:
+        #       targets:
+        #       - { model: chat-general, priority: 0 }
+        #       - { model: chat-cloud, priority: 1 }
 
       # /mcp: one MCP endpoint for every team. Each target is an MCP server; tools keep their own
       # names (prefixMode: never), so names must be unique across targets.
@@ -214,6 +318,9 @@ configs:
           mcp: { host: "http://memsvc:8041/mcp" }
         - name: tools                     # example shared tools; register any streamable-HTTP MCP server the same way
           mcp: { host: "http://tools:8050/mcp" }
+        # OPTIONAL: a legacy SSE MCP server (pin its image; never `npx -y` at start-up).
+        # - name: sequentialthinking
+        #   sse: { host: sequentialthinking, port: 8000, path: /sse }
         policies:
           apiKey: *teamKeys
           # Stamp the caller's team on every memory call (overrides anything the client sent).
@@ -223,21 +330,33 @@ configs:
                 x-team: 'apiKey.team'
           mcpAuthorization:
             rules:
-            # alpha: every tool on /mcp
-            - 'apiKey.team == "alpha"'
+            # alpha: every tool of the targets named here. Grant new targets explicitly, never with a bare team rule.
+            - 'apiKey.team == "alpha" && mcp.tool.target in ["memory", "tools"]'
             # beta: memory without forget/reindex, and the offline tools only (no http_get)
             - 'apiKey.team == "beta" && mcp.tool.target == "memory" && mcp.tool.name in ["memory_search", "memory_get", "memory_write"]'
             - 'apiKey.team == "beta" && mcp.tool.target == "tools" && mcp.tool.name in ["utc_now", "calculate"]'
+          # OPA sees the JSON-RPC body, so it can check tool arguments.
+          extAuthz: &opaWithBody
+            host: opa:9191
+            protocol:
+              grpc:
+                metadata:
+                  team: apiKey.team
+            failureMode: deny
+            includeRequestBody:
+              maxRequestBytes: 262144
+              allowPartialMessage: false
 
+      routes:
       # /cli/<team>: each team's own CLI runner (an MCP server with run_command + runner_info).
       # Only that team's key gets through, and the runner also checks the X-Team the gateway sets.
-      routes:
       - name: cli-alpha
         matches: [ { path: { exact: /cli/alpha } } ]
         policies:
           apiKey: *teamKeys
           authorization: { rules: [ { require: 'apiKey.team == "alpha"' } ] }
           transformations: { request: { set: { x-team: 'apiKey.team' } } }
+          extAuthz: *opaWithBody
         backends:
         - mcp:
             targets:
@@ -249,10 +368,35 @@ configs:
           apiKey: *teamKeys
           authorization: { rules: [ { require: 'apiKey.team == "beta"' } ] }
           transformations: { request: { set: { x-team: 'apiKey.team' } } }
+          extAuthz: *opaWithBody
         backends:
         - mcp:
             targets:
             - name: cli
               mcp: { host: "http://cli-beta:8060/mcp" }
+      # /docs: API reference (Swagger UI + docs/openapi.yaml). Public: it holds no secrets, and every
+      # "Try it out" call still needs a team key.
+      - name: docs
+        matches: [ { path: { pathPrefix: /docs } } ]
+        backends:
+        - host: docs:8080
+      # OPTIONAL: an MCP backend that acts as the end user. The client sends the user's own token in
+      # x-user-token; the gateway forwards it as Authorization and strips it.
+      # - name: crm-mcp
+      #   matches: [ { path: { pathPrefix: /crm/mcp } } ]
+      #   policies:
+      #     apiKey: *teamKeys
+      #     mcpAuthorization: { rules: [ 'apiKey.team == "alpha"' ] }
+      #     extAuthz: *opaWithBody
+      #   backends:
+      #   - mcp:
+      #       targets:
+      #       - name: crm
+      #         mcp: { host: "https://crm.example.com/mcp" }
+      #         policies:
+      #           transformations:
+      #             request:
+      #               set: { authorization: '"Bearer " + request.headers["x-user-token"]' }
+      #               remove: [x-user-token]
 
       ui: {}

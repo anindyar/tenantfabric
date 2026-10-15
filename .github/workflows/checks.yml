@@ -1,0 +1,33 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: open-policy-agent/setup-opa@v2
+        with:
+          version: 0.70.0
+      - name: OPA policy tests
+        run: |
+          opa fmt --fail -l policy/
+          opa check --strict policy/
+          opa test policy/ -v
+      - name: Compose and Kubernetes copies are in sync
+        run: |
+          pip install pyyaml
+          python3 tests/check_sync.py
+      - name: Compose file is valid
+        run: docker compose config -q
+      - name: Gateway config is valid
+        run: |
+          docker compose config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["configs"]["agentgateway"]["content"])' > /tmp/gw.yaml
+          docker run --rm -v /tmp/gw.yaml:/gw.yaml:ro ghcr.io/agentgateway/agentgateway:v1.5.0 -f /gw.yaml --validate-only

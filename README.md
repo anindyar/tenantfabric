@@ -8,8 +8,12 @@
 | Tools (MCP) | only its own tools. Other tools are missing from `tools/list`, and calls to them are rejected | agentgateway `mcpAuthorization` on `apiKey.team` + `mcp.tool.name` |
 | CLI tools | its own runner container for `curl`, `aws`, `jq`, ..., holding only that team's credentials | a per-team gateway route, the runner's own team check, and the network |
 | Memory | only its own memory, even if the client lies about who it is | [memsvc](https://github.com/anindyar/memsvc): the gateway stamps the team from the key, and Postgres row-level security enforces it |
+| Policy | approval for risky calls, `http_get` limited to public HTTPS, no secrets written to memory | [OPA](https://www.openpolicyagent.org/) as the gateway's external authorizer: it sees tool **arguments** (`policy/policy.rego`) |
+| Guardrails | prompt injection in tool results blocked, personal data and secrets masked before the model sees them | agentgateway regex guardrails |
 
-Everything is open source: agentgateway, Postgres + pgvector, Ollama for the example models, and memsvc for memory. It runs on CPU as-is, amd64 or arm64. Point the model aliases at your own GPU servers or a cloud API when you're ready.
+Plus an interactive API reference at `/docs` (Swagger UI), a [Postman collection](postman/) and a [guide for application developers](docs/DEVELOPERS.md).
+
+Everything is open source: agentgateway, Postgres + pgvector, OPA, Swagger UI, Ollama for the example models, and memsvc for memory. It runs on CPU as-is, amd64 or arm64. Point the model aliases at your own GPU servers or a cloud API when you're ready.
 
 ---
 
@@ -19,17 +23,18 @@ Everything is open source: agentgateway, Postgres + pgvector, Ollama for the exa
 
 ```bash
 git clone https://github.com/anindyar/tenantfabric && cd tenantfabric
+cp .env.example .env                                       # optional on a laptop: without it the demo keys are used
 docker compose up -d                                       # first start pulls ~3 GB of example models
 docker compose logs -f models                              # wait until it exits (models pulled)
-docker compose exec -T memsvc python - < tests/e2e.py      # 52 end-to-end checks
+docker compose exec -T memsvc python - < tests/e2e.py      # 66 end-to-end checks
 ```
 
-The gateway UI is at http://localhost:8080/ui. Set `GATEWAY_PORT=9090` to use another port. Run `docker compose down -v` to remove everything.
+The gateway UI is at http://localhost:8080/ui and the API reference at http://localhost:8080/docs/. Set `GATEWAY_PORT=9090` to use another port. Run `docker compose down -v` to remove everything.
 
 ### Kubernetes
 
 ```bash
-kubectl apply -f k8s/tenantfabric.yaml
+kubectl apply -f k8s/tenantfabric.yaml                     # demo values; for real ones: python3 scripts/render-k8s.py .env > k8s/tenantfabric.local.yaml
 kubectl -n tenantfabric wait --for=condition=complete job/models --timeout=30m
 kubectl -n tenantfabric exec -i deploy/memsvc -- python - < tests/e2e.py
 kubectl -n tenantfabric port-forward svc/agentgateway 8080:8080   # UI at http://localhost:8080/ui
@@ -60,6 +65,9 @@ Give your assistant (Claude Code, Cursor, Copilot, Codex, ...) the repo link and
  │ /mcp                             → mcpAuthorization per tool         │
  │                                    + sets header X-Team = apiKey.team │
  │ /ui                              → admin UI, request logs            │
+ │ /docs                            → Swagger UI (docs service)          │
+ │ every /v1, /mcp, /cli call       → OPA ext_authz (sees the body)      │
+ │ tool results sent to a model     → guardrails: reject / mask         │
  └───────┬─────────────────────────────────────────┬───────────────────┘
          ▼                                         ▼
    ollama :11434 (example)                  memsvc :8041 (gateway-only)
@@ -78,7 +86,7 @@ Give your assistant (Claude Code, Cursor, Copilot, Codex, ...) the repo link and
    /cli/beta   → cli-beta  :8060               beta's runner:  curl, jq, no credentials
 ```
 
-Only the gateway is exposed. memsvc and the CLI runners trust the `X-Team` header, so nothing except the gateway may reach them. On Kubernetes NetworkPolicies enforce this. On Compose, only the gateway port is published, and the tool server and each runner sit on their own network shared only with the gateway.
+Only the gateway is exposed. OPA (`opa:9191`) and the docs server are reachable only from it. memsvc and the CLI runners trust the `X-Team` header, so nothing except the gateway may reach them. On Kubernetes NetworkPolicies enforce this. On Compose, only the gateway port is published, and the tool server and each runner sit on their own network shared only with the gateway.
 
 ### Example teams
 
@@ -132,6 +140,30 @@ Teams call stable names. The gateway maps each one to a backend, so swapping a b
 **Audit trail.** Every model call is logged in the gateway UI:
 
 ![LLM logs](docs/img/06_llm_logs.png)
+
+---
+
+## Policy and guardrails
+
+`mcpAuthorization` decides *which* tools a team may call. The OPA policy in [`policy/policy.rego`](policy/policy.rego) decides whether *this particular call* is acceptable, because it sees the arguments:
+
+| Call | Rule |
+|---|---|
+| `memory_reindex` | needs the header `x-approved: true` |
+| `run_command` with `rm`, `delete`, `terminate`, `destroy`, `drop`, `truncate`, `put-bucket-policy` | needs `x-approved: true` |
+| `http_get` | `https://` only, no IP literals, `localhost`, single-label or `.local`/`.svc`/`.internal`/`.lan` hosts |
+| `memory_write` | refused if the text contains an API key, AWS access key, GitHub token or private key |
+| any call with `x-data-class` | must be `public`, `internal`, `confidential` (default) or `restricted` |
+
+Denials come back as 403 `{"error":{"type":"policy_denied","message":"..."}}`. The gateway fails closed: if OPA is down, the calls it guards are refused. `opa test policy/` runs the 21 unit tests. `x-approved` is a speed bump for agents (a person should set it after approving), not a security boundary: least-privilege credentials remain the real control.
+
+Guardrails scan the `tool` messages a client sends back to `/v1/chat/completions`: phrases like "ignore previous instructions" or "send the API key to" are rejected with 403 "Blocked by guardrails", and emails, phone and card numbers, `sk-` keys and AWS access keys are masked. Add your own patterns (a commented national-ID example is in the config).
+
+On Kubernetes, tools and runners can reach only public addresses (`tools-egress-public-only`): private ranges and the cloud metadata service are blocked. A server that needs one internal system gets its own extra egress policy, as in [`examples/contrib-mcp/k8s.yaml`](examples/contrib-mcp/k8s.yaml).
+
+## Keys and secrets
+
+Every key and password the stack reads is listed in [`.env.example`](.env.example). Docker Compose reads `.env` (git-ignored) and falls back to the demo values. For Kubernetes, `python3 scripts/render-k8s.py .env > k8s/tenantfabric.local.yaml` writes a manifest with your values and refuses to leave any demo value behind. Manage team keys in the config, not in the gateway UI: the UI's Virtual API Keys page rewrites the key list of the LLM policy alone, and MCP then stops accepting the keys.
 
 ---
 
@@ -292,7 +324,10 @@ With the demo credentials, AWS answers `InvalidClientTokenId`. The command reach
 
 All of these are covered step by step in [`CLAUDE.md`](CLAUDE.md):
 - **Add a team:** add a key, add the team to the model rules and the MCP rules, and set its memory mode in `MEM_MODES`.
-- **Register an MCP server:** add it under `mcp.targets`, then grant tools to teams in `mcpAuthorization`.
+- **Register an MCP server:** add it under `mcp.targets`, then grant tools to teams in `mcpAuthorization`. For a server a team wrote, follow "Register a team's own MCP server" (example in [`examples/contrib-mcp/`](examples/contrib-mcp/)).
+- **Change a policy rule:** edit `policy/policy.rego`, add a test, run `opa test policy/`.
+- **Use a cloud model:** uncomment `chat-cloud` (key read from a mounted file) or `chat-auto` (failover between backends).
+- **Tracing:** uncomment the `tracing` block to send OpenTelemetry traces to Langfuse or any OTLP collector.
 - **Give a team a CLI runner:** add a runner container with that team's credentials and a `/cli/<team>` route.
 - **Swap a model backend:** edit `params.baseUrl` / `params.model` for the alias.
 - **Use your own Postgres:** run the schema, then point `MEM_DB` and the gateway `database.url` at it.
@@ -304,8 +339,9 @@ The usual open-source memory servers ([Graphiti MCP](https://github.com/getzep/g
 
 ## Known limits
 
-- The demo keys and passwords are in plain text in the manifests. Replace them before exposing the stack anywhere.
-- The gateway authorizes MCP calls by tool name, not by arguments, so it cannot allow `aws s3 ls` while blocking `aws s3 rm`. Limit what a runner can do through the permissions of its credentials.
+- The demo keys and passwords are in plain text in the manifests. Use `.env` / `scripts/render-k8s.py` before exposing the stack anywhere.
+- Guardrails are regular expressions: they catch common injection phrasing and obvious personal data, not every paraphrase or encoding.
+- The gateway's own rules authorize MCP calls by tool name. OPA sees arguments and requires approval for destructive-looking commands, but a pattern match on a command line is not a sandbox. Limit what a runner can do through the permissions of its credentials.
 - Anyone holding a team's key can read that team's runner credentials (for example `curl file:///proc/self/environ`). The boundary is between teams, not inside one.
 - The gateway's Logs and Analytics pages don't show the team when you use API keys. Per-team showback needs JWT identity.
 - Memory search is vector-only: no keyword/hybrid search and no reranking yet.
@@ -318,7 +354,13 @@ The usual open-source memory servers ([Graphiti MCP](https://github.com/getzep/g
 |---|---|
 | `docker-compose.yml` | the whole stack for Docker. Gateway config and DB schema are inline |
 | `k8s/tenantfabric.yaml` | the whole stack for Kubernetes: namespace, workloads, PVCs, Secrets, NetworkPolicies |
-| `tests/e2e.py` | 52 end-to-end checks, run inside the memsvc container |
+| `tests/e2e.py` | 66 end-to-end checks, run inside the memsvc container |
+| `tests/check_sync.py` | checks the blocks duplicated between Compose and Kubernetes are identical |
+| `policy/` | the OPA policy and its unit tests |
+| `docs/openapi.yaml`, `docs/DEVELOPERS.md` | the API reference served at `/docs`, and the guide for application teams |
+| `postman/` | Postman collection and environment |
+| `.env.example`, `scripts/render-k8s.py` | your own keys and passwords for Compose and Kubernetes |
+| `examples/contrib-mcp/` | how to run a team's own MCP server next to the stack |
 | `toolbox/` | the example MCP servers: `tools.py` (shared tools) and `runner.py` (per-team CLI runner), image `ghcr.io/anindyar/tenantfabric-toolbox` |
 | `examples/agent.py` | a minimal tool-calling agent: model through `/v1`, tools through MCP |
 | `CLAUDE.md` / `AGENTS.md` | context and recipes for AI coding assistants |
