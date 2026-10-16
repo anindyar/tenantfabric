@@ -1,0 +1,75 @@
+# EXAMPLE: running a team's own MCP server ("invoices", owned by team beta) next to tenantfabric.
+# The image, port, secret and egress destination are example values: replace them with the reviewed ones.
+# Steps and the gateway change are in CLAUDE.md, "Register a team's own MCP server".
+#
+# What makes it safe to plug in:
+#   - label app.kubernetes.io/component: mcp-tools  -> tools-from-gateway-only admits only the gateway
+#   - its own egress policy: DNS + the one system it needs, nothing else
+#   - credentials from a Secret, non-root, read-only root filesystem, no service-account token, pinned digest
+apiVersion: v1
+kind: Secret
+metadata:
+  name: invoices-mcp
+  namespace: tenantfabric
+stringData:
+  ERP_API_TOKEN: replace-me
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: invoices-mcp
+  namespace: tenantfabric
+  labels: { app.kubernetes.io/name: invoices-mcp, app.kubernetes.io/component: mcp-tools, tenantfabric.io/owner-team: beta }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: invoices-mcp }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: invoices-mcp, app.kubernetes.io/component: mcp-tools, tenantfabric.io/owner-team: beta }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      containers:
+      - name: server
+        image: registry.example.com/invoices-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000
+        env:
+        - { name: PORT, value: "8070" }
+        - { name: ERP_API_URL, value: "https://erp.example.com/api" }
+        - name: ERP_API_TOKEN
+          valueFrom: { secretKeyRef: { name: invoices-mcp, key: ERP_API_TOKEN } }
+        ports: [{ containerPort: 8070 }]
+        readinessProbe:
+          tcpSocket: { port: 8070 }
+          periodSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: { drop: [ALL] }
+        volumeMounts:
+        - { name: tmp, mountPath: /tmp }
+      volumes:
+      - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: invoices-mcp
+  namespace: tenantfabric
+spec:
+  selector: { app.kubernetes.io/name: invoices-mcp }
+  ports: [{ name: http, port: 8070 }]
+---
+# This server needs one external system. NetworkPolicies are additive, so this allows the ERP address on top
+# of tools-egress-public-only. For an internal (private-range) system, this is the only way in.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: invoices-mcp-egress
+  namespace: tenantfabric
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: invoices-mcp } }
+  policyTypes: [Egress]
+  egress:
+  - to: [{ ipBlock: { cidr: 192.0.2.10/32 } }]     # example address of the ERP API
+    ports: [{ port: 443, protocol: TCP }]
